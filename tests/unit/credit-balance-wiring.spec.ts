@@ -1,7 +1,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { AccountPool } from '../../src/account-pool.js'
-import { registerJetHubRpc } from '../../src/jet-hub-rpc.js'
+import { JET_HUB_API_PATH, registerJetHubRpc } from '../../src/jet-hub-rpc.js'
 import { PROVIDER_REGISTRY } from '../../src/provider-registry.js'
 import type { CreditBalance } from '../../src/credits.js'
 import { clearProviderRuntimes } from '../../src/provider-runtime.js'
@@ -29,8 +29,20 @@ afterEach(async () => {
   vi.clearAllMocks()
 })
 
-async function setup() {
+/**
+ * @param options.preexistingService 预先在根 ctx 上注册一个 `creditBalance`，
+ *   模拟「服务已存在」——本函数被重复调用时就是这种局面。
+ * @param options.pluginRootCtx 替换传给 `registerJetHubRpc` 的第 5 参（插件根 ctx），
+ *   用于构造「`get` 探测不到、但 `provide` 会抛错」的并发窗口。
+ */
+async function setup(options: {
+  preexistingService?: unknown
+  pluginRootCtx?: (inner: Context) => unknown
+} = {}) {
   const ctx = new Context()
+  if (options.preexistingService !== undefined) {
+    ctx.provide('creditBalance', options.preexistingService as never)
+  }
   const resolve = vi.fn(async (ref: string) => ({ value: JSON.stringify({ access_token: `${ref}-PRIVATE` }), source: 'fixture' }))
   ctx.provide('credentials', { resolve } as never)
   ctx.provide('commands', { register: () => () => {}, definitions: [] } as never)
@@ -49,17 +61,29 @@ async function setup() {
     // ⚠️ 第 5 参传**插件根 ctx**：服务必须注册在这里才对他插件可见；
     // 若回退到 connectionCtx（第 2 个实参内部用的那个），下面「服务可见性」
     // 的断言会得到 undefined —— 这正是本 PR 要修的那个缺陷。
-    registerJetHubRpc(inner, pool, Object.fromEntries(PROVIDER_REGISTRY.map((p) => [p.id, {}])) as never, undefined, inner)
+    const pluginRoot = options.pluginRootCtx === undefined ? inner : options.pluginRootCtx(inner)
+    registerJetHubRpc(inner, pool, Object.fromEntries(PROVIDER_REGISTRY.map((p) => [p.id, {}])) as never, undefined, pluginRoot as never)
   })
   disposers.push(async () => fork.dispose())
+  // ⚠️ 记录被注册的路由：`connection.fetch.register` 是 `/api/jet-hub` 的**唯一**
+  // 注册点。余额服务若在它之前抛错，这段就执行不到 ⇒ 路由整体消失（线上表现为
+  // `HTTP 404` + 供应商开关读不出）。不记录就无法断言这个后果。
+  const registeredPaths: string[] = []
   const mountConnection = () => {
     const connection = ctx.plugin((inner) => {
-      inner.provide('connection', { fetch: { register: () => () => {} } } as never)
+      inner.provide('connection', {
+        fetch: {
+          register: (route: { path: string }) => {
+            registeredPaths.push(route.path)
+            return () => {}
+          },
+        },
+      } as never)
     })
     disposers.push(async () => connection.dispose())
     return connection
   }
-  return { ctx, pool, resolve, mountConnection }
+  return { ctx, pool, resolve, mountConnection, registeredPaths }
 }
 
 describe('宿主余额服务真实接线', () => {
@@ -105,5 +129,53 @@ describe('宿主余额服务真实接线', () => {
     }
     expect(resolve).not.toHaveBeenCalled()
     expect(probes.read).not.toHaveBeenCalled()
+  })
+
+  /**
+   * ## 为什么这两条用例必须存在
+   *
+   * 上面三条用例全部跑在**测试替身**上，而替身的 `provide` 从不抛错。真实 Cordis
+   * 对同名服务只允许注册一次，重复注册直接 `throw`：
+   *
+   * ```
+   * service "creditBalance" has been registered at <fiber>
+   * ```
+   *
+   * 于是「31/31 全绿」并不能说明这段代码在真实宿主上安全。这两条用例专门复现
+   * 真实宿主的行为，覆盖两种情况：
+   *
+   * 1. **服务已存在** → 走 `get` 预检跳过，不重复注册，已有实例保持不动；
+   * 2. **预检没探到、`provide` 仍抛错**（并发窗口）→ 只 warn，绝不向上抛，
+   *    保证紧随其后的 `/api/jet-hub` 路由注册照常完成。
+   *
+   * 第 2 条是重点：它断言的是**路由还在**。缺陷版代码在这里会让整条路由消失，
+   * 用户看到的是「供应商开关读取失败：HTTP 404」，而余额只是其中一部分。
+   */
+  it('服务已存在时不重复注册，保留已有实例且路由照常注册', async () => {
+    const preexisting = { supportedProviders: () => [], creditsBalances: async () => ({ accounts: [] }) }
+    const { ctx, mountConnection, registeredPaths } = await setup({ preexistingService: preexisting })
+    mountConnection()
+    await expect.poll(() => registeredPaths).toContain(JET_HUB_API_PATH)
+    // 已有实例必须原样保留 —— 不能被本次注册覆盖成新对象。
+    expect(ctx.creditBalance).toBe(preexisting)
+  })
+
+  it('provide 抛错时只告警，不阻断 /api/jet-hub 路由注册', async () => {
+    const warn = vi.fn()
+    const { ctx, mountConnection, registeredPaths } = await setup({
+      // 构造「get 探测不到、provide 会抛错」的并发窗口：用一个 get 返回 undefined、
+      // 但 provide 模拟真实 Cordis 重复注册异常的 ctx 替身包住真实 ctx。
+      pluginRootCtx: (inner) => ({
+        get: () => undefined,
+        provide: () => { throw new Error('service "creditBalance" has been registered at root') },
+        logger: { warn },
+        effect: inner.effect.bind(inner),
+      }),
+    })
+    mountConnection()
+    // 关键断言：路由仍然注册成功。缺陷版代码在此处会因异常向上传播而漏注册。
+    await expect.poll(() => registeredPaths).toContain(JET_HUB_API_PATH)
+    // 「已注册」属正常重复调用，不应刷告警。
+    expect(warn).not.toHaveBeenCalled()
   })
 })

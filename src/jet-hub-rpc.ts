@@ -3532,23 +3532,69 @@ function registerJetHubEndpoints(
    */
   const jetHubRootCtx = pluginRootCtx ?? ctx
   /**
-   * ⚠️ 用 `?.` 是有意的（不是偷懒）：`ctx.provide` 在**测试替身**与 older 宿主里
-   * 都可能不存在，而同一份代码还要跑那两类环境。原实现也是 `ctx.provide?.(…)`。
+   * ## ⚠️⚠️ 为什么注册必须幂等 + try/catch
    *
-   * ⚠️ 但「静默跳过」正是本 PR 要修的缺陷之一：跳过之后消费方拿到 `null`、
-   * 且**没有任何日志**。故这里保留可选调用，只在缺席时补一条明确 warn，
-   * 让「服务没注册」从不可观测变成一眼可见。
+   * 本函数**会随 `connection` 重建被多次调用**，而 Cordis 的 `provide()` 对同名
+   * 服务只允许注册一次，重复注册直接 `throw`：
+   *
+   * ```
+   * service "creditBalance" has been registered at <fiber>
+   * ```
+   *
+   * 这个异常若不接住，会顺着本函数向上抛，导致紧随其后的
+   * `connection.fetch.register(...)` **根本执行不到** —— 后果不是「余额拿不到」
+   * 这么局部，而是整个 `/api/jet-hub` 路由消失：
+   *
+   * - 前端报 `transport failure for /api/jet-hub: HTTP 404`
+   * - 供应商开关状态读不出来
+   * - 账号管理一并失效
+   *
+   * 也就是说，**一个只影响余额投影的次要能力，会把插件的主要功能一起拖垮**。
+   * 线上实测踩过这个坑，故这里做两层防护：
+   *
+   * 1. 注册前先 `get` 探测，已存在则跳过（幂等，保留首个实例）；
+   * 2. 即使探测不到、`provide` 仍抛错，也只 warn 不抛，绝不影响后续注册。
+   *
+   * ⚠️ 用 `typeof … === 'function'` 而非直接调用是有意的：`ctx.provide` 在
+   * **测试替身**与 older 宿主里都可能不存在，而同一份代码还要跑那两类环境。
+   * 但「静默跳过」正是本 PR 要修的缺陷之一：跳过之后消费方拿到 `null`、
+   * 且**没有任何日志**。故缺席时补一条明确 warn，让「服务没注册」可观测。
    */
-  const disposeCreditBalance = typeof jetHubRootCtx.provide === 'function'
-    ? jetHubRootCtx.provide(
-      'creditBalance',
-      createCreditBalanceService({
-        providers: () => PROVIDER_REGISTRY.filter((provider) => provider.id !== OPENCODE.id),
-        read: (provider) => handleMethod('credits.balances', { provider }),
-      }),
-    )
-    : (ctx.logger?.warn?.('[jet-hub] creditBalance 服务未注册：当前 ctx 没有 provide()，'
-      + 'usage/billing 等消费方将拿不到本插件的余额投影。') , undefined)
+  let alreadyProvided = false
+  try {
+    alreadyProvided = typeof jetHubRootCtx.get === 'function'
+      && jetHubRootCtx.get('creditBalance') !== undefined
+  }
+  catch {
+    // 探测失败按「未注册」处理，交给下面的 provide 分支再试一次。
+  }
+
+  let disposeCreditBalance: (() => void) | undefined
+  if (alreadyProvided) {
+    // 幂等分支：本函数被重复调用，服务已在 —— 保留已有实例，不重复注册。
+  }
+  else if (typeof jetHubRootCtx.provide === 'function') {
+    try {
+      disposeCreditBalance = jetHubRootCtx.provide(
+        'creditBalance',
+        createCreditBalanceService({
+          providers: () => PROVIDER_REGISTRY.filter((provider) => provider.id !== OPENCODE.id),
+          read: (provider) => handleMethod('credits.balances', { provider }),
+        }),
+      )
+    }
+    catch (error) {
+      const detail = String((error as { message?: unknown } | undefined)?.message)
+      // 「已注册」属正常并发/重复调用，不必告警；其他错误才提示。
+      if (!/has been registered|already declared/.test(detail)) {
+        ctx.logger?.warn?.('[jet-hub] creditBalance 服务注册失败（不影响本插件其余功能）：' + detail)
+      }
+    }
+  }
+  else {
+    ctx.logger?.warn?.('[jet-hub] creditBalance 服务未注册：当前 ctx 没有 provide()，'
+      + 'usage/billing 等消费方将拿不到本插件的余额投影。')
+  }
   // ⚠️ 把撤销绑在 `connection` 的生命周期上（本函数运行在 connection 的 fiber 内）。
   //    `ctx.effect` 的清理函数会在该 fiber 卸载时执行，于是服务随 connection 消失，
   //    与用例「移除时撤销、重新挂载时创建新实例」的语义一致。
