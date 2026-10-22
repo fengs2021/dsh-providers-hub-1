@@ -337,6 +337,7 @@ import {
   createBadgePreferenceStore,
 } from './badge-preferences.js'
 import { createUsageBadge, type BadgeRpcResult } from './usage-badge.js'
+import { createCreditBalanceService } from './credit-balance-service.js'
 import { createAutoCheckin, createAutoCheckinStore } from './auto-checkin.js'
 import type { ChannelCredential, ProviderProduct } from './jwt-utils.js'
 
@@ -1468,7 +1469,7 @@ export function registerJetHubRpc(
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
 ): void {
   ctx.inject(['connection'], (connectionCtx) => {
-    registerJetHubEndpoints(connectionCtx as Context, pool, auths, modelAdapters)
+    registerJetHubEndpoints(connectionCtx as Context, pool, auths, modelAdapters, ctx)
   })
 }
 
@@ -2034,6 +2035,15 @@ function registerJetHubEndpoints(
   pool: AccountPool,
   auths: JetHubAuths,
   modelAdapters?: Readonly<Record<string, ModelCatalogSource>>,
+  /**
+   * **插件根 ctx**（`registerJetHubRpc` 收到的那个），与本函数的 `ctx` 不同：
+   * 后者是 `ctx.inject(['connection'], …)` 的**回调参数**。
+   *
+   * ⚠️ 只有它能把服务注册成「对其他插件可见」——用注入回调参数 provide 的
+   * 服务在别的插件里 `get` 恒为 `undefined`（真实 Cordis 三格对照实测）。
+   * 省略时回退到 `ctx`（保持旧行为，仅为不破坏既有调用点）。
+   */
+  pluginRootCtx?: Context,
 ): void {
   // ⚠️ 解构一次，函数体其余部分**逐字不动** —— 这样本次改动的 diff 面最小，
   //    评审能一眼看出「只是换了个入口」。
@@ -3486,6 +3496,65 @@ function registerJetHubEndpoints(
     readAutoCheckin: () => autoCheckin.state(),
     warn: (message) => ctx.logger?.warn?.(message),
   })
+
+  /**
+   * 余额仍走本宿主的账号隔离、自愈及缓存路径；其他插件只拿脱敏后的投影。
+   * OpenCode 这里的“余额”其实是本地通道可用数，不能当作 Go 订阅额度导出。
+   *
+   * ## ⚠️⚠️ 为什么不能直接用本函数的 `ctx`
+   *
+   * `registerJetHubEndpoints` 的 `ctx` 形参来自
+   * `ctx.inject(['connection'], (connectionCtx) => …)` 的**回调参数**。
+   * 用真实 Cordis 运行时做三格对照实测：
+   *
+   * | 注册写法 | 其他插件能否读到 |
+   * |---|---|
+   * | inject 回调参数 `c.provide(…)` | `undefined` |
+   * | 插件根 `ctx.provide(…)` | `function` |
+   * | 根 ctx provide（写在 inject 回调里） | `function` |
+   *
+   * 用注入回调参数注册的服务**对别的插件不可见** —— 消费方拿到的
+   * `creditBalance` 恒为 `null`，其面板里本插件的渠道停在 `pending`、
+   * adapter 为 `null`，而两边日志都没有任何线索。
+   *（对照 `dsh-cost-meter`：它用根 ctx 调 `ctx.provide('costMeter', …)` 一直正常。）
+   *
+   * ## ⚠️⚠️ 但也不能一路提到应用根（`ctx.root`）
+   *
+   * `ctx.provide` 的生命周期绑在**注册它的那个 fiber** 上。提到应用根后，
+   * `connection` 卸载时服务**不会被撤销**（接线用例实测：期望变 `undefined`，
+   * 实际仍是旧实例）—— 那是比原缺陷更难察觉的泄漏。
+   *
+   * ## 正确做法：注册在插件根，但把「撤销」挂到 connection 的生命周期上
+   *
+   * `provide` 返回的 disposer 交给 `ctx.fiber.effect` 之外的**显式清理**：
+   * 这里用 `connection` 的 fiber 作用域包一层 effect，connection 一撤，
+   * 注册就跟着撤销；而注册目标仍是插件根 ctx ⇒ 对他插件可见。
+   */
+  const jetHubRootCtx = pluginRootCtx ?? ctx
+  /**
+   * ⚠️ 用 `?.` 是有意的（不是偷懒）：`ctx.provide` 在**测试替身**与 older 宿主里
+   * 都可能不存在，而同一份代码还要跑那两类环境。原实现也是 `ctx.provide?.(…)`。
+   *
+   * ⚠️ 但「静默跳过」正是本 PR 要修的缺陷之一：跳过之后消费方拿到 `null`、
+   * 且**没有任何日志**。故这里保留可选调用，只在缺席时补一条明确 warn，
+   * 让「服务没注册」从不可观测变成一眼可见。
+   */
+  const disposeCreditBalance = typeof jetHubRootCtx.provide === 'function'
+    ? jetHubRootCtx.provide(
+      'creditBalance',
+      createCreditBalanceService({
+        providers: () => PROVIDER_REGISTRY.filter((provider) => provider.id !== OPENCODE.id),
+        read: (provider) => handleMethod('credits.balances', { provider }),
+      }),
+    )
+    : (ctx.logger?.warn?.('[jet-hub] creditBalance 服务未注册：当前 ctx 没有 provide()，'
+      + 'usage/billing 等消费方将拿不到本插件的余额投影。') , undefined)
+  // ⚠️ 把撤销绑在 `connection` 的生命周期上（本函数运行在 connection 的 fiber 内）。
+  //    `ctx.effect` 的清理函数会在该 fiber 卸载时执行，于是服务随 connection 消失，
+  //    与用例「移除时撤销、重新挂载时创建新实例」的语义一致。
+  if (disposeCreditBalance !== undefined) {
+    ctx.effect(() => () => { void disposeCreditBalance() }, 'jet-hub: creditBalance service')
+  }
 
   connection.fetch.register({
     path: JET_HUB_API_PATH,
